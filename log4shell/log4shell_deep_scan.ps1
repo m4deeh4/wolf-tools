@@ -42,12 +42,15 @@ function Escape-FilePath($s) {
 # clear all errors, add compression
 $error.Clear()
 Add-Type -AssemblyName "System.IO.Compression"
+Add-Type -AssemblyName "System.IO.Compression.Filesystem"
 
 # globals
 $scan_ts = $(Get-Date -format 'o')
 $hostname = [System.Net.Dns]::GetHostName()
 $vulnerable_java_apps = @()
 $unreadable_java_apps = @()
+$inaccessible_java_apps = @()
+$corrupt_java_apps = @()
 $Mutex = New-Object System.Threading.Mutex
 
 # default output_path and validate 
@@ -69,6 +72,10 @@ if (Test-Path $log_filepath) {
 }
 
 # default search_root, ensure it is an array
+if (($search_root) -and -not (Test-Path $search_root)) {
+  Write-Output "ERROR: $search_root is not an existing directory."
+  exit 0
+}
 if ($search_root) {
   $search_roots = @($search_root)
 } else {
@@ -106,7 +113,34 @@ function Check-Archive {
     [System.IO.Stream]$Stream=$(throw "Mandatory parameter -Stream")
   )
   Write-Log 'INFO' "checking $Path"
-  $Archive = New-Object System.IO.Compression.ZipArchive $Stream
+  $archive_error = $False
+  $is_corrupt_error = $False
+  try {
+    $Archive = New-Object System.IO.Compression.ZipArchive $Stream
+  } catch {
+    # New-Object System.IO.Compression.ZipArchive doesn't throw predictable errors
+    # check if corrupt file
+    $archive_error = $_.Exception.Message
+    try {
+      [void]([io.compression.zipfile]::OpenRead($Path).Entries)
+    } catch [System.Management.Automation.MethodInvocationException] {
+      if ($_.FullyQualifiedErrorId -eq 'InvalidDataException') {
+        $archive_error = $_.Exception.Message
+        $is_corrupt_error = $True
+      }
+    } catch {
+      $archive_error = $_.Exception.Message
+    }
+
+    if ($is_corrupt_error) {
+      #write corruption error to log, etc.
+      $script:corrupt_java_apps += $Path
+      Write-Log 'WARN' $("Corrupt File: {0}" -f $archive_error)
+    } else {
+      $script:unreadable_java_apps += $Path
+      Write-Log 'WARN' $("Other Error: {0}" -f $archive_error)
+    }
+  }
   try {
     # iterate over jar contents
     $found_jndilookup_class = $false
@@ -164,13 +198,10 @@ this class is found within an application, the script looks for updates to the
 to Log4J that indicate the application has been updated to use Log4J 2.16+ or
 Log4J 2.12.2+. If the application contains JndiLookup.class but does not appear
 to have been updated, the application is vulnerable.
-
 For additional information and usage please see the readme.txt.
 ------------------------------------------------------------------------------
-
 Finding all JAR files under $search_roots and scanning each.
 This can take several minutes. Ctrl-c to abort.
-
 "@
 
 #
@@ -184,17 +215,41 @@ try {
   Write-Log 'INFO' "Windows $([System.Environment]::OSVersion.Version.ToString())"
 
   # iterate across search roots, calling Check-Archive for each java app
-  $search_roots | 
-  ForEach-Object {Get-ChildItem -Path $_ -ErrorAction SilentlyContinue -Force -Recurse} | 
-  Where-Object {!$_.PSIsContainer -and (".jar",".war",".ear") -contains $_.extension} | 
+  $search_roots |
+  ForEach-Object {Get-ChildItem -Path $_ -ErrorAction SilentlyContinue -Force -Recurse} |
+  Where-Object {!$_.PSIsContainer -and (".jar",".war",".ear") -contains $_.extension} |
   ForEach-Object {
     # we found a jar/war/ear, let's check it!
+    $Path = $_.FullName
+    $file_open_error = $False
+    $is_permission_error = $False
     try {
-      $Path = $_.FullName
-      $Stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open)
-      Check-Archive -Path $Path -Stream $Stream
+      $Stream = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
     } catch {
-      if (-Not ($Path -match '\\\$Recycle\.Bin\\')) {
+      # New-Object System.IO.FileStream doesn't throw predictable errors
+      # check if permission access issue
+      $file_open_error = $_.Exception.Message
+      try {
+        [void](Get-Content "$Path" -First 1 -ErrorAction Stop)
+      } catch [System.UnauthorizedAccessException] {
+        $file_open_error = $_.Exception.Message
+        $is_permission_error = $True
+      } catch {
+        $file_open_error = $_.Exception.Message
+      }
+      if ($is_permission_error) {
+        #write permission error to log, etc.
+        $script:inaccessible_java_apps += $Path
+        Write-Log 'WARN' $("Permission Error: {0}" -f $file_open_error)
+      } else {
+        $script:unreadable_java_apps += $Path
+        Write-Log 'WARN' $("Other Error: {0}" -f $file_open_error)
+      }
+    }
+    if (($file_open_error -eq $False) -and (-Not ($Path -match '\\\$Recycle\.Bin\\'))) {
+      try {
+        Check-Archive -Path $Path -Stream $Stream
+      } catch {
         $script:unreadable_java_apps += $Path
         Write-Log 'WARN' $("failed to read {0}: {1}" -f $Path, $_.Exception.Message)
       }
@@ -203,7 +258,7 @@ try {
 } catch {
   Write-Log 'ERROR' $_
   Write-Output $_
-  Write-Output "Result: ERROR"  
+  Write-Output "Result: ERROR"
   exit 1
 }
 
@@ -236,8 +291,30 @@ Log4Shell (CVE-2021-44228, CVE-2021-45046).
       }
   }
 
+  if ($corrupt_java_apps) {
+    Write-Output "`nWARNING: The following files are corrupt:"
+    foreach ($corrupt_jar in $corrupt_java_apps) {
+      Write-Output "- $corrupt_jar"
+    }
+  }
+
+  if ($inaccessible_java_apps) {
+    Write-Output "`nWARNING: User '$env:USERNAME' does not have access to the following applications:"
+    foreach ($inaccessible_jar in $inaccessible_java_apps) {
+      Write-Output "- $inaccessible_jar"
+    }
+  }
+
   if ($unreadable_java_apps) {
-    Write-Output "`nWARNING`nThe following applications were not readable by this detection script:`n"
+    Write-Output "`nWARNING: The following applications were not readable by this detection script:"
+    foreach ($unreadable_jar in $unreadable_java_apps) {
+      Write-Output "- $unreadable_jar"
+    }
+  }
+
+  $unreadable_java_apps += $inaccessible_java_apps + $corrupt_java_apps
+
+  if ($unreadable_java_apps) {
     $json_string += ','
     $i = 0
     foreach ($unreadable_jar in $unreadable_java_apps) {
@@ -258,15 +335,35 @@ Log4Shell (CVE-2021-44228, CVE-2021-45046).
   Write-Output "For remediation steps, contact the vendor of each affected application."
   exit 1
 
-} elseif ($unreadable_java_apps) {
+} elseif (($unreadable_java_apps) -or ($inaccessible_java_apps) -or ($corrupt_java_apps)) {
   Write-Log 'INFO' 'Result: UNKNOWN'
   Write-Output @"
 Result: UNKNOWN
-No Java applications containing unpatched Log4j were found, but the following
-applications were not readable by this detection script:
-
+No Java applications containing unpatched Log4j were found. However,
 "@
 
+  if ($corrupt_java_apps) {
+    Write-Output "`nWARNING: The following files are corrupt:"
+    foreach ($corrupt_jar in $corrupt_java_apps) {
+      Write-Output "- $corrupt_jar"
+    }
+  }
+
+  if ($inaccessible_java_apps) {
+    Write-Output "`nWARNING: User '$env:USERNAME' does not have access to the following applications:"
+    foreach ($inaccessible_jar in $inaccessible_java_apps) {
+      Write-Output "- $inaccessible_jar"
+    }
+  }
+
+  if ($unreadable_java_apps) {
+    Write-Output "`nWARNING: The following applications were not readable by this detection script:"
+    foreach ($unreadable_jar in $unreadable_java_apps) {
+      Write-Output "- $unreadable_jar"
+    }
+  }
+
+  $unreadable_java_apps += $inaccessible_java_apps + $corrupt_java_apps
   $i = 0
   $json_string = "["
   foreach ($unreadable_jar in $unreadable_java_apps) {
@@ -275,12 +372,9 @@ applications were not readable by this detection script:
     $unreadable_jar_escaped = Escape-JSON $unreadable_jar
     $json_string += "`n  { `"hostname`":`"$hostname`", `"scan_ts`":`"$scan_ts`", `"scan_v`":`"0.2`", `"search_root`":`"$search_root_escaped`", `"result`":`"UNKNOWN`", `"unscanned_jar`":`"$unreadable_jar_escaped`" }"
     if ($i -lt $unreadable_java_apps.length) {
-        $json_string += ','
+      $json_string += ','
     }
   }
-  $json_string += "`n]"
-  $json_string | Out-File "$output_filepath"
-
   exit 1
 } else {
   Write-Log 'INFO' 'Result: PASS'
